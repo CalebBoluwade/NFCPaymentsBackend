@@ -1,0 +1,219 @@
+package services
+
+import (
+	"encoding/json"
+	"encoding/xml"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/moov-io/iso20022/pkg/common"
+	"github.com/moov-io/iso20022/pkg/pacs_v08"
+	"github.com/ruralpay/backend/internal/models"
+)
+
+type ISO20022Service struct{
+	validator *ValidationHelper
+}
+
+func NewISO20022Service() *ISO20022Service {
+	return &ISO20022Service{
+		validator: NewValidationHelper(),
+	}
+}
+
+// ConvertToISO20022 converts transaction to ISO20022 format
+// @Summary Convert to ISO20022
+// @Description Convert transaction data to ISO20022 XML format
+// @Tags iso20022
+// @Accept json
+// @Produce json
+// @Param transaction body models.Transaction true "Transaction to convert"
+// @Success 200 {object} object{status=string,messageType=string,xml=string}
+// @Failure 500 {object} map[string]string
+// @Router /iso20022/convert [post]
+func (iso *ISO20022Service) ConvertToISO20022(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req models.Transaction
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		SendErrorResponse(w, "Invalid request body", http.StatusBadRequest, nil)
+		return
+	}
+
+	if err := iso.validator.ValidateStruct(&req); err != nil {
+		SendErrorResponse(w, "Validation failed", http.StatusBadRequest, err)
+		return
+	}
+
+	// Create pacs.008 document
+	pacs008, err := iso.CreatePacs008(&req)
+	if err != nil {
+		SendErrorResponse(w, err.Error(), http.StatusInternalServerError, nil)
+		return
+	}
+
+	// Convert to XML
+	xmlData, err := iso.ConvertToXML(pacs008)
+	if err != nil {
+		SendErrorResponse(w, err.Error(), http.StatusInternalServerError, nil)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "converted",
+		"messageType": "pacs.008.001.08",
+		"xml":         xmlData,
+	})
+}
+
+// ProcessSettlement processes transaction settlement
+// @Summary Process settlement
+// @Description Process transaction settlement using ISO20022
+// @Tags iso20022
+// @Accept json
+// @Produce json
+// @Param transaction body models.Transaction true "Transaction to settle"
+// @Success 200 {object} object{status=string,messageType=string}
+// @Failure 500 {object} map[string]string
+// @Router /iso20022/settlement [post]
+func (iso *ISO20022Service) ProcessSettlement(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req models.Transaction
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		SendErrorResponse(w, "Invalid request body", http.StatusBadRequest, nil)
+		return
+	}
+
+	if err := iso.validator.ValidateStruct(&req); err != nil {
+		SendErrorResponse(w, "Validation failed", http.StatusBadRequest, err)
+		return
+	}
+
+	// Create pacs.002 status report
+	pacs002, err := iso.CreatePacs002(&req, "ACCP")
+	if err != nil {
+		SendErrorResponse(w, err.Error(), http.StatusInternalServerError, nil)
+		return
+	}
+
+	// Send to settlement
+	err = iso.SendToSettlement(pacs002)
+	if err != nil {
+		SendErrorResponse(w, err.Error(), http.StatusInternalServerError, nil)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "settled",
+		"messageType": "pacs.002.001.08",
+	})
+}
+
+func (iso *ISO20022Service) ConvertTransaction(tx *models.Transaction) (*pacs_v08.FIToFICustomerCreditTransferV08, error) {
+	return iso.CreatePacs008(tx)
+}
+
+func (iso *ISO20022Service) SendToSettlement(doc interface{}) error {
+	// Convert to XML and send to settlement system
+	xmlData, err := xml.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal XML: %w", err)
+	}
+
+	// TODO: Implement actual settlement system integration
+	fmt.Printf("Sending to settlement: %s\n", string(xmlData))
+	return nil
+}
+
+// CreatePacs008 creates a pacs.008 FIToFICustomerCreditTransfer message
+func (iso *ISO20022Service) CreatePacs008(tx *models.Transaction) (*pacs_v08.FIToFICustomerCreditTransferV08, error) {
+	msgId := uuid.New().String()
+	creDtTm := time.Now()
+	settlementDate := time.Now()
+
+	doc := &pacs_v08.FIToFICustomerCreditTransferV08{
+		GrpHdr: pacs_v08.GroupHeader93{
+			MsgId:   common.Max35Text(msgId),
+			CreDtTm: common.ISODateTime(creDtTm),
+			NbOfTxs: "1",
+			TtlIntrBkSttlmAmt: &pacs_v08.ActiveCurrencyAndAmount{
+				Ccy:   common.ActiveCurrencyCode(tx.Currency),
+				Value: tx.Amount,
+			},
+			IntrBkSttlmDt: (*common.ISODate)(&settlementDate),
+			SttlmInf: pacs_v08.SettlementInstruction7{
+				SttlmMtd: "CLRG", // Clearing
+			},
+		},
+		CdtTrfTxInf: []pacs_v08.CreditTransferTransaction39{
+			{
+				PmtId: pacs_v08.PaymentIdentification7{
+					InstrId:    &[]common.Max35Text{common.Max35Text(tx.TransactionID)}[0],
+					EndToEndId: common.Max35Text(tx.ReferenceID),
+					TxId:       &[]common.Max35Text{common.Max35Text(tx.TransactionID)}[0],
+				},
+				IntrBkSttlmAmt: pacs_v08.ActiveCurrencyAndAmount{
+					Ccy:   common.ActiveCurrencyCode(tx.Currency),
+					Value: tx.Amount,
+				},
+				IntrBkSttlmDt: (*common.ISODate)(&settlementDate),
+				ChrgBr:        "SLEV",
+				DbtrAgt: pacs_v08.BranchAndFinancialInstitutionIdentification6{
+					FinInstnId: pacs_v08.FinancialInstitutionIdentification18{
+						BICFI: &[]common.BICFIDec2014Identifier{common.BICFIDec2014Identifier("RURALPAY")}[0],
+					},
+				},
+				Dbtr: pacs_v08.PartyIdentification135{
+					Nm: &[]common.Max140Text{common.Max140Text(tx.FromCardID)}[0],
+				},
+				CdtrAgt: pacs_v08.BranchAndFinancialInstitutionIdentification6{
+					FinInstnId: pacs_v08.FinancialInstitutionIdentification18{
+						ClrSysMmbId: &pacs_v08.ClearingSystemMemberIdentification2{
+							MmbId: common.Max35Text(tx.ToBankCode),
+						},
+					},
+				},
+				Cdtr: pacs_v08.PartyIdentification135{
+					Nm: &[]common.Max140Text{common.Max140Text(tx.ToCardID)}[0],
+				},
+			},
+		},
+	}
+
+	return doc, nil
+}
+
+// CreatePacs002 creates a pacs.002 payment status report
+func (iso *ISO20022Service) CreatePacs002(tx *models.Transaction, status string) (*pacs_v08.FIToFIPaymentStatusReportV08, error) {
+	msgId := uuid.New().String()
+	creDtTm := time.Now()
+
+	doc := &pacs_v08.FIToFIPaymentStatusReportV08{
+		GrpHdr: pacs_v08.GroupHeader53{
+			MsgId:   common.Max35Text(msgId),
+			CreDtTm: common.ISODateTime(creDtTm),
+		},
+		TxInfAndSts: []pacs_v08.PaymentTransaction80{
+			{
+				OrgnlInstrId:    &[]common.Max35Text{common.Max35Text(tx.TransactionID)}[0],
+				OrgnlEndToEndId: &[]common.Max35Text{common.Max35Text(tx.ReferenceID)}[0],
+				OrgnlTxId:       &[]common.Max35Text{common.Max35Text(tx.TransactionID)}[0],
+				TxSts:           &[]pacs_v08.ExternalPaymentTransactionStatus1Code{pacs_v08.ExternalPaymentTransactionStatus1Code(status)}[0], // ACCP, RJCT, ACSC, etc.
+			},
+		},
+	}
+
+	return doc, nil
+}
+
+// ConvertToXML converts ISO20022 document to XML string
+func (iso *ISO20022Service) ConvertToXML(doc interface{}) (string, error) {
+	xmlData, err := xml.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal XML: %w", err)
+	}
+	return xml.Header + string(xmlData), nil
+}

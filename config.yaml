@@ -1,0 +1,31 @@
+# Database Configuration
+database:
+  host: localhost
+  port: 5432
+  user: postgres
+  password: password
+  name: nfc_payments
+  ssl_mode: disable
+  max_open_conns: 25
+  max_idle_conns: 5
+  conn_max_lifetime: 5m
+
+# Redis Configuration
+redis:
+  host: localhost
+  port: 6379
+  password: ""
+  db: 0
+
+# HSM Configuration
+hsm:
+  master_key: ""
+  key_store_path: ./keys
+  key_rotation_days: 30
+  salt: ""
+
+# Transaction Fees Configuration
+fees:
+  transfer_percentage: 0.5
+  transfer_fixed: 50
+  system_account: "0000000001"
