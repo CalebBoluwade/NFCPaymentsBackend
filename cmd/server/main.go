@@ -35,13 +35,25 @@ var hsmInstance hsm.HSMInterface
 
 func main() {
 	// Initialize config
-	viper.SetConfigName("config")
-	viper.SetConfigType("yaml")
-	viper.AddConfigPath(".")
-	viper.AutomaticEnv()
+	viper.SetConfigFile(".env") // explicitly point to .env file
+	viper.AutomaticEnv()        // allow environment variables to override .env
+	viper.ReadInConfig()        // read .env file
 
 	// Set environment variable prefix
 	viper.SetEnvPrefix("")
+
+	viper.BindEnv("database.host", "DATABASE_HOST")
+	viper.BindEnv("database.port", "DATABASE_PORT")
+	viper.BindEnv("database.user", "DATABASE_USER")
+	viper.BindEnv("database.password", "DATABASE_PASSWORD")
+	viper.BindEnv("database.name", "DATABASE_NAME")
+	viper.BindEnv("database.ssl_mode", "DATABASE_SSL_MODE")
+
+	viper.BindEnv("redis.host", "REDIS_HOST")
+	viper.BindEnv("redis.port", "REDIS_PORT")
+	viper.BindEnv("redis.password", "REDIS_PASSWORD")
+	viper.BindEnv("redis.db", "REDIS_DB")
+
 	viper.BindEnv("hsm.master_key", "HSM_MASTER_KEY")
 	viper.BindEnv("hsm.salt", "HSM_SALT")
 	viper.BindEnv("hsm.key_store_path", "HSM_KEY_STORE_PATH")
