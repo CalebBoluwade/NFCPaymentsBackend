@@ -177,3 +177,14 @@ Tests can be integrated into CI/CD pipelines:
 2. Add debug prints in tests if needed
 3. Check mock expectations are being met
 4. Verify test data matches validation rules
+
+
+
+
+
+
+nfc_payments_user
+P36AmcBBgLSw7TrVNKDrJUu0TbQrFqKN
+postgresql://nfc_payments_user:P36AmcBBgLSw7TrVNKDrJUu0TbQrFqKN@dpg-d5iaod6r433s73c81vog-a/nfc_payments
+
+redis://red-d5iaph15pdvs73btmgh0:6379

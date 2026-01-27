@@ -8,6 +8,7 @@ import (
 type Location struct {
 	Latitude  float64 `json:"latitude" db:"latitude"`
 	Longitude float64 `json:"longitude" db:"longitude"`
+	Accuracy  float64 `json:"accuracy" db:"accuracy"`
 	Address   string  `json:"address" db:"address"`
 }
 

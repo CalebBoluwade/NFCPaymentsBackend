@@ -93,7 +93,7 @@ func (h *USSDHandler) GenerateCode(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[USSD] GenerateCode - Success: code=%s, formattedCode=%s, expiresIn=%d", code, formattedCode, expiresIn)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"success":   true,
 		"ussdCode":  formattedCode,
 		"expiresIn": expiresIn,

@@ -15,80 +15,26 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
-        "/account": {
-            "get": {
-                "description": "Get authenticated user's account information",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "auth"
-                ],
-                "summary": "Get user account details",
-                "responses": {
-                    "200": {
-                        "description": "User account details",
-                        "schema": {
-                            "$ref": "#/definitions/services.User"
-                        }
-                    },
-                    "401": {
-                        "description": "Unauthorized",
-                        "schema": {
-                            "type": "string"
-                        }
-                    },
-                    "500": {
-                        "description": "Internal server error",
-                        "schema": {
-                            "type": "string"
-                        }
-                    }
-                }
-            }
-        },
         "/accounts/balance-enquiry": {
             "get": {
-                "description": "Retrieve account balance for a given account ID and bank code (checks local DB first, then external API)",
+                "description": "Retrieve all accounts and cards with balances for the authenticated user",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "accounts"
                 ],
-                "summary": "Get account balance",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Account ID",
-                        "name": "accountId",
-                        "in": "query",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Bank Code",
-                        "name": "bankCode",
-                        "in": "query"
-                    }
-                ],
+                "summary": "Get user accounts and cards",
                 "responses": {
                     "200": {
                         "description": "OK",
                         "schema": {
                             "type": "object",
                             "properties": {
-                                "accountId": {
-                                    "type": "string"
-                                },
-                                "availableBalance": {
-                                    "type": "integer",
-                                    "format": "int64"
+                                "accounts": {
+                                    "type": "array"
                                 },
                                 "responseCode": {
-                                    "type": "string"
-                                },
-                                "source": {
                                     "type": "string"
                                 },
                                 "status": {
@@ -97,17 +43,8 @@ const docTemplate = `{
                             }
                         }
                     },
-                    "403": {
-                        "description": "Forbidden",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
+                    "401": {
+                        "description": "Unauthorized",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -129,7 +66,7 @@ const docTemplate = `{
         },
         "/accounts/name-enquiry": {
             "get": {
-                "description": "Retrieve account name for a given account ID and bank code (checks local DB first, then external API)",
+                "description": "Retrieve account name for a given account ID and bank code",
                 "produces": [
                     "application/json"
                 ],
@@ -206,6 +143,132 @@ const docTemplate = `{
                 }
             }
         },
+        "/accounts/validate-bvn": {
+            "post": {
+                "description": "Validate a Bank Verification Number and send OTP",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "accounts"
+                ],
+                "summary": "Validate BVN",
+                "parameters": [
+                    {
+                        "description": "BVN validation request",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OTP sent successfully",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid request",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/accounts/verify-otp": {
+            "post": {
+                "description": "Verify OTP sent for BVN validation",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "accounts"
+                ],
+                "summary": "Verify OTP",
+                "parameters": [
+                    {
+                        "description": "OTP verification request",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OTP verified successfully",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid request",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid or expired OTP",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/account": {
+            "get": {
+                "description": "Get authenticated user's account information",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth"
+                ],
+                "summary": "Get user account details",
+                "responses": {
+                    "200": {
+                        "description": "User account details",
+                        "schema": {
+                            "$ref": "#/definitions/services.User"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
         "/auth/login": {
             "post": {
                 "description": "Authenticate user with email and password",
@@ -260,7 +323,7 @@ const docTemplate = `{
         },
         "/auth/logout": {
             "post": {
-                "description": "Logout user (client should discard token)",
+                "description": "Logout user and blacklist token",
                 "produces": [
                     "application/json"
                 ],
@@ -697,6 +760,127 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    }
+                }
+            }
+        },
+        "/qr/generate": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Generate a QR code for payment with specified amount",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "QR"
+                ],
+                "summary": "Generate QR Code",
+                "parameters": [
+                    {
+                        "description": "QR generation request",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "amount": {
+                                    "type": "integer",
+                                    "format": "int64"
+                                }
+                            }
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "qrCode": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/services.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/services.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/qr/process": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Process a scanned QR code data",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "QR"
+                ],
+                "summary": "Process QR Code",
+                "parameters": [
+                    {
+                        "description": "QR processing request",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "qrData": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "amount": {
+                                    "type": "integer",
+                                    "format": "int64"
+                                },
+                                "userId": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/services.ErrorResponse"
                         }
                     }
                 }
@@ -1218,6 +1402,9 @@ const docTemplate = `{
         "models.Location": {
             "type": "object",
             "properties": {
+                "accuracy": {
+                    "type": "number"
+                },
                 "address": {
                     "type": "string"
                 },
@@ -1231,7 +1418,7 @@ const docTemplate = `{
         },
         "models.Metadata": {
             "type": "object",
-            "additionalProperties": true
+            "additionalProperties": {}
         },
         "models.Transaction": {
             "type": "object",
@@ -1343,20 +1530,20 @@ const docTemplate = `{
             "description": "Login request structure",
             "type": "object",
             "required": [
-                "email",
-                "password"
+                "password",
+                "phoneNumber"
             ],
             "properties": {
-                "email": {
-                    "description": "User email address",
-                    "type": "string",
-                    "example": "user@example.com"
-                },
                 "password": {
                     "description": "User password",
                     "type": "string",
                     "minLength": 6,
                     "example": "password123"
+                },
+                "phoneNumber": {
+                    "description": "User phone number",
+                    "type": "string",
+                    "example": "+2348012345678"
                 }
             }
         },
@@ -1364,12 +1551,19 @@ const docTemplate = `{
             "description": "Registration request structure",
             "type": "object",
             "required": [
+                "BVN",
                 "Email",
                 "FirstName",
                 "LastName",
-                "Password"
+                "Password",
+                "PhoneNumber"
             ],
             "properties": {
+                "BVN": {
+                    "description": "Bank Verification Number",
+                    "type": "string",
+                    "example": "12345678901"
+                },
                 "Email": {
                     "description": "User email address",
                     "type": "string",
@@ -1392,6 +1586,11 @@ const docTemplate = `{
                     "type": "string",
                     "minLength": 6,
                     "example": "password123"
+                },
+                "PhoneNumber": {
+                    "description": "Phone number",
+                    "type": "string",
+                    "example": "+2348012345678"
                 }
             }
         },
@@ -1458,19 +1657,33 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "amount": {
-                    "type": "integer",
-                    "format": "int64"
+                    "type": "integer"
                 },
                 "code": {
                     "type": "string"
                 },
+                "createdAt": {
+                    "type": "string"
+                },
+                "currency": {
+                    "type": "string"
+                },
+                "expired": {
+                    "type": "boolean"
+                },
                 "expiresAt": {
                     "type": "string"
                 },
-                "type": {
+                "transactionId": {
+                    "type": "string"
+                },
+                "txType": {
                     "$ref": "#/definitions/services.USSDCodeType"
                 },
-                "userID": {
+                "used": {
+                    "type": "boolean"
+                },
+                "userId": {
                     "type": "string"
                 }
             }
@@ -1495,6 +1708,11 @@ const docTemplate = `{
                     "type": "string",
                     "example": "1234567890"
                 },
+                "BVN": {
+                    "description": "User BVN",
+                    "type": "string",
+                    "example": "12345678901"
+                },
                 "FirstName": {
                     "description": "User first name",
                     "type": "string",
@@ -1504,6 +1722,11 @@ const docTemplate = `{
                     "description": "User last name",
                     "type": "string",
                     "example": "Doe"
+                },
+                "PhoneNumber": {
+                    "description": "User phone number",
+                    "type": "string",
+                    "example": "+2348012345678"
                 },
                 "email": {
                     "description": "User email",

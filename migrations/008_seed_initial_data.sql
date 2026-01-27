@@ -2,7 +2,7 @@
 DELETE FROM accounts;
 
 -- Alter table structure
--- ALTER TABLE accounts 
+-- ALTER TABLE accounts               
 -- DROP COLUMN id CASCADE,
 -- ADD COLUMN id SERIAL PRIMARY KEY,
 -- ADD COLUMN account_name VARCHAR(255) NOT NULL,

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	cryptorand "crypto/rand"
 	"database/sql"
 	"encoding/base64"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/go-redis/redis/v8"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/spf13/viper"
 	"golang.org/x/crypto/argon2"
@@ -21,23 +23,26 @@ import (
 
 type AuthService struct {
 	db        *sql.DB
+	redis     *redis.Client
 	validator *validator.Validate
 }
 
 // LoginRequest represents the login request payload
 // @Description Login request structure
 type LoginRequest struct {
-	Email    string `json:"email" validate:"required,email" example:"user@example.com"` // User email address
-	Password string `json:"password" validate:"required,min=6" example:"password123"`   // User password
+	PhoneNumber string `json:"phoneNumber" validate:"required" example:"+2348012345678"` // User phone number
+	Password    string `json:"password" validate:"required,min=6" example:"password123"` // User password
 }
 
 // RegisterRequest represents the registration request payload
 // @Description Registration request structure
 type RegisterRequest struct {
-	Email     string `json:"Email" validate:"required,email" example:"user@example.com"` // User email address
-	Password  string `json:"Password" validate:"required,min=6" example:"password123"`   // User password
-	FirstName string `json:"FirstName" validate:"required,min=2" example:"John"`         // User first name
-	LastName  string `json:"LastName" validate:"required,min=2" example:"Doe"`           // User last name
+	Email       string `json:"Email" validate:"required,email" example:"user@example.com"` // User email address
+	Password    string `json:"Password" validate:"required,min=6" example:"password123"`   // User password
+	FirstName   string `json:"FirstName" validate:"required,min=2" example:"John"`         // User first name
+	LastName    string `json:"LastName" validate:"required,min=2" example:"Doe"`           // User last name
+	BVN         string `json:"BVN" validate:"required,len=11" example:"12345678901"`       // Bank Verification Number
+	PhoneNumber string `json:"PhoneNumber" validate:"required" example:"+2348012345678"`   // Phone number
 }
 
 // AuthResponse represents the authentication response
@@ -50,16 +55,20 @@ type AuthResponse struct {
 // User represents user information
 // @Description User structure
 type User struct {
-	ID        int    `json:"id" example:"1"`                   // User ID
-	Email     string `json:"email" example:"user@example.com"` // User email
-	FirstName string `json:"FirstName" example:"John"`         // User first name
-	LastName  string `json:"LastName" example:"Doe"`           // User last name
-	AccountId string `json:"AccountId" example:"1234567890"`   // User account ID`
+	ID          int    `json:"id" example:"1"`                       // User ID
+	Email       string `json:"email" example:"user@example.com"`     // User email
+	FirstName   string `json:"FirstName" example:"John"`             // User first name
+	LastName    string `json:"LastName" example:"Doe"`               // User last name
+	AccountId   string `json:"AccountId" example:"1234567890"`       // User account ID`
+	PhoneNumber string `json:"PhoneNumber" example:"+2348012345678"` // User phone number
+	BVN         string `json:"BVN" example:"12345678901"`            // User BVN
+	DeviceID    string `json:"device_id"`
 }
 
-func NewAuthService(db *sql.DB) *AuthService {
+func NewAuthService(db *sql.DB, redisClient *redis.Client) *AuthService {
 	return &AuthService{
 		db:        db,
+		redis:     redisClient,
 		validator: validator.New(),
 	}
 }
@@ -131,11 +140,11 @@ func (s *AuthService) Register(w http.ResponseWriter, r *http.Request) {
 
 	// Insert user with account_id
 	var userID int
-	err = tx.QueryRow("INSERT INTO users (email, password, first_name, last_name, account_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-		req.Email, hashedPassword, req.FirstName, req.LastName, accountID).Scan(&userID)
+	err = tx.QueryRow("INSERT INTO users (email, password, first_name, last_name, account_id, bvn, phone_number) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+		strings.ToLower(req.Email), hashedPassword, req.FirstName, req.LastName, accountID, req.BVN, req.PhoneNumber).Scan(&userID)
 	if err != nil {
 		log.Printf("[AUTH] User creation failed for %s: %v", req.Email, err)
-		s.sendErrorResponse(w, "Email already exists", http.StatusConflict, nil)
+		s.sendErrorResponse(w, "Email Already Exists", http.StatusConflict, nil)
 		return
 	}
 
@@ -215,20 +224,20 @@ func (s *AuthService) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[AUTH] Login request for email: %s", req.Email)
+	log.Printf("[AUTH] Login request for phone number: %s", req.PhoneNumber)
 
 	var user User
 	var hashedPassword string
-	err := s.db.QueryRow("SELECT id, email, first_name, last_name, password, account_id FROM users WHERE email = $1",
-		req.Email).Scan(&user.ID, &user.Email, &user.FirstName, &user.LastName, &hashedPassword, &user.AccountId)
+	err := s.db.QueryRow("SELECT id, email, first_name, last_name, password, account_id FROM users WHERE phone_number = $1",
+		req.PhoneNumber).Scan(&user.ID, &user.Email, &user.FirstName, &user.LastName, &hashedPassword, &user.AccountId)
 	if err != nil {
-		log.Printf("[AUTH] User not found for email: %s", req.Email)
+		log.Printf("[AUTH] User not found for phone number: %s", req.PhoneNumber)
 		s.sendErrorResponse(w, "Invalid credentials", http.StatusUnauthorized, nil)
 		return
 	}
 
 	if !verifyPassword(req.Password, hashedPassword) {
-		log.Printf("[AUTH] Invalid password for user: %s", req.Email)
+		log.Printf("[AUTH] Invalid password for user: %s", req.PhoneNumber)
 		s.sendErrorResponse(w, "Invalid credentials", http.StatusUnauthorized, nil)
 		return
 	}
@@ -254,14 +263,133 @@ func (s *AuthService) Login(w http.ResponseWriter, r *http.Request) {
 
 // Logout handles user logout
 // @Summary Logout user
-// @Description Logout user (client should discard token)
+// @Description Logout user and blacklist token
 // @Tags auth
 // @Produce json
 // @Success 200 {object} map[string]string "Logout successful"
 // @Router /auth/logout [post]
 func (s *AuthService) Logout(w http.ResponseWriter, r *http.Request) {
+	token := r.Header.Get("Authorization")
+	if token != "" && len(token) > 7 {
+		token = token[7:] // Remove "Bearer " prefix
+
+		if s.redis != nil {
+			ctx := context.Background()
+			key := fmt.Sprintf("blacklist:%s", token)
+			// Blacklist token until its expiration
+			expiry := time.Duration(viper.GetInt("jwt.expiry_hours")) * time.Hour
+			if err := s.redis.Set(ctx, key, "1", expiry).Err(); err != nil {
+				log.Printf("[AUTH] Failed to blacklist token: %v", err)
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"message": "Logout successful"})
+}
+
+// ValidateBVN validates a BVN number and sends OTP
+// @Summary Validate BVN
+// @Description Validate a Bank Verification Number and send OTP
+// @Tags accounts
+// @Accept json
+// @Produce json
+// @Param request body map[string]string true "BVN validation request"
+// @Success 200 {object} map[string]interface{} "OTP sent successfully"
+// @Failure 400 {string} string "Invalid request"
+// @Router /accounts/validate-bvn [post]
+func (s *AuthService) ValidateBVN(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		BVN         string `json:"bvn" validate:"required,len=11"`
+		PhoneNumber string `json:"phoneNumber" validate:"required"`
+		Email       string `json:"email" validate:"required,email"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.sendErrorResponse(w, "Invalid request", http.StatusBadRequest, nil)
+		return
+	}
+
+	if err := s.validator.Struct(&req); err != nil {
+		s.sendErrorResponse(w, "Validation failed", http.StatusBadRequest, err)
+		return
+	}
+
+	otp := generateOTP()
+	key := fmt.Sprintf("bvn_otp:%s", req.BVN)
+
+	if s.redis != nil {
+		ctx := context.Background()
+		if err := s.redis.Set(ctx, key, otp, 10*time.Minute).Err(); err != nil {
+			log.Printf("[AUTH] Failed to store OTP in Redis: %v", err)
+			s.sendErrorResponse(w, "Failed to generate OTP", http.StatusInternalServerError, nil)
+			return
+		}
+	}
+
+	log.Printf("[AUTH] OTP generated for BVN %s: %s (Phone: %s, Email: %s)", req.BVN, otp, req.PhoneNumber, req.Email)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"message": "OTP Sent Successfully",
+		"valid":   true,
+	})
+}
+
+// VerifyOTP verifies the OTP for BVN validation
+// @Summary Verify OTP
+// @Description Verify OTP sent for BVN validation
+// @Tags accounts
+// @Accept json
+// @Produce json
+// @Param request body map[string]string true "OTP verification request"
+// @Success 200 {object} map[string]interface{} "OTP verified successfully"
+// @Failure 400 {string} string "Invalid request"
+// @Failure 401 {string} string "Invalid or expired OTP"
+// @Router /accounts/verify-otp [post]
+func (s *AuthService) VerifyOTP(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		BVN string `json:"bvn" validate:"required,len=11"`
+		OTP string `json:"otp" validate:"required,len=8"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.sendErrorResponse(w, "Invalid request", http.StatusBadRequest, nil)
+		return
+	}
+
+	if err := s.validator.Struct(&req); err != nil {
+		s.sendErrorResponse(w, "Validation failed", http.StatusBadRequest, err)
+		return
+	}
+
+	key := fmt.Sprintf("bvn_otp:%s", req.BVN)
+
+	if s.redis != nil {
+		ctx := context.Background()
+		storedOTP, err := s.redis.Get(ctx, key).Result()
+		if err != nil {
+			log.Printf("[AUTH] OTP not found or expired for BVN %s", req.BVN)
+			s.sendErrorResponse(w, "Invalid or expired OTP", http.StatusUnauthorized, nil)
+			return
+		}
+
+		if storedOTP != req.OTP {
+			log.Printf("[AUTH] Invalid OTP for BVN %s", req.BVN)
+			s.sendErrorResponse(w, "Invalid or expired OTP", http.StatusUnauthorized, nil)
+			return
+		}
+
+		s.redis.Del(ctx, key)
+	}
+
+	log.Printf("[AUTH] OTP verified successfully for BVN %s", req.BVN)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"message": "OTP Verified Successfully",
+		"valid":   true,
+	})
 }
 
 // GetUserAccount retrieves user account details from auth token
@@ -272,7 +400,7 @@ func (s *AuthService) Logout(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} User "User account details"
 // @Failure 401 {string} string "Unauthorized"
 // @Failure 500 {string} string "Internal server error"
-// @Router /account [get]
+// @Router /auth/account [get]
 func (s *AuthService) GetUserAccount(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[AUTH] User account request from IP: %s", r.RemoteAddr)
 
@@ -285,8 +413,8 @@ func (s *AuthService) GetUserAccount(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[AUTH] Fetching account details for user ID: %v", userID)
 	var user User
-	err := s.db.QueryRow("SELECT id, email, first_name, last_name FROM users WHERE id = $1",
-		userID).Scan(&user.ID, &user.Email, &user.FirstName, &user.LastName)
+	err := s.db.QueryRow("SELECT users.id, email, first_name, last_name, phone_number, users.account_id FROM users LEFT JOIN accounts ON users.id = accounts.user_id WHERE users.id = $1",
+		userID).Scan(&user.ID, &user.Email, &user.FirstName, &user.LastName, &user.PhoneNumber, &user.AccountId)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			log.Printf("[AUTH] User not found for ID: %v", userID)
@@ -306,6 +434,7 @@ func (s *AuthService) GetUserAccount(w http.ResponseWriter, r *http.Request) {
 func generateJWT(userID int) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"user_id": userID,
+		"nameid":  userID,
 		"exp":     time.Now().Add(time.Duration(viper.GetInt("jwt.expiry_hours")) * time.Hour).Unix(),
 	})
 
@@ -357,4 +486,10 @@ func generateAccountID() string {
 		b[i] = digits[rand.Intn(len(digits))]
 	}
 	return string(b)
+}
+
+func generateOTP() string {
+	b := make([]byte, 4)
+	cryptorand.Read(b)
+	return fmt.Sprintf("%08d", (int(b[0])<<24|int(b[1])<<16|int(b[2])<<8|int(b[3]))%100000000)
 }

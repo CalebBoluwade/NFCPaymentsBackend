@@ -22,7 +22,7 @@ func TestTransactionService_CreateTransaction(t *testing.T) {
 
 	redisClient, _ := redismock.NewClientMock()
 	mockHSM := &MockHSM{}
-	
+
 	service := NewTransactionService(db, redisClient, mockHSM)
 
 	t.Run("successful transaction", func(t *testing.T) {
@@ -66,7 +66,7 @@ func TestTransactionService_AccountNameEnquiry(t *testing.T) {
 		r.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		var response map[string]interface{}
+		var response map[string]any
 		json.Unmarshal(w.Body.Bytes(), &response)
 		assert.Equal(t, "00", response["responseCode"])
 		assert.Equal(t, "John Doe", response["accountName"])
@@ -136,7 +136,7 @@ func TestTransactionService_AccountBalanceEnquiry(t *testing.T) {
 		r.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		var response map[string]interface{}
+		var response map[string]any
 		json.Unmarshal(w.Body.Bytes(), &response)
 		assert.Equal(t, "00", response["responseCode"])
 		assert.Equal(t, float64(5000), response["availableBalance"])

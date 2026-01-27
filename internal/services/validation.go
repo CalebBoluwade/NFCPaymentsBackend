@@ -27,7 +27,7 @@ func NewValidationHelper() *ValidationHelper {
 }
 
 // ValidateStruct validates a struct and returns validation errors
-func (vh *ValidationHelper) ValidateStruct(s interface{}) error {
+func (vh *ValidationHelper) ValidateStruct(s any) error {
 	return vh.validator.Struct(s)
 }
 
@@ -35,14 +35,14 @@ func (vh *ValidationHelper) ValidateStruct(s interface{}) error {
 func SendErrorResponse(w http.ResponseWriter, message string, statusCode int, validationErr error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	
+
 	errorResp := ErrorResponse{Error: message}
 	if validationErr != nil {
 		errorResp.Details = make(map[string]string)
 		for _, err := range validationErr.(validator.ValidationErrors) {
-			errorResp.Details[err.Field()] = fmt.Sprintf("Field validation failed on '%s' tag", err.Tag())
+			errorResp.Details[err.Field()] = fmt.Sprintf("Field Validation Failed on '%s' tag", err.Tag())
 		}
 	}
-	
+
 	json.NewEncoder(w).Encode(errorResp)
 }

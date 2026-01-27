@@ -6,9 +6,16 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/spf13/viper"
 )
+
+var redisClient *redis.Client
+
+func InitAuthMiddleware(redis *redis.Client) {
+	redisClient = redis
+}
 
 func AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -28,6 +35,16 @@ func AuthMiddleware(next http.Handler) http.Handler {
 
 		token := parts[1]
 
+		// Check if token is blacklisted
+		if redisClient != nil {
+			ctx := context.Background()
+			key := fmt.Sprintf("blacklist:%s", token)
+			if exists, _ := redisClient.Exists(ctx, key).Result(); exists > 0 {
+				http.Error(w, "Token has been revoked", http.StatusUnauthorized)
+				return
+			}
+		}
+
 		// Validate token (implement your JWT validation here)
 		userID, err := validateToken(token)
 		if err != nil {
@@ -42,16 +59,15 @@ func AuthMiddleware(next http.Handler) http.Handler {
 }
 
 func validateToken(tokenString string) (string, error) {
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+	claims := jwt.MapClaims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (any, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
 		return []byte(viper.GetString("jwt.secret_key")), nil
 	})
 
 	if err != nil || !token.Valid {
-		return "", err
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
 		return "", err
 	}
 

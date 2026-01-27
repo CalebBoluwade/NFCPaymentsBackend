@@ -83,7 +83,7 @@ const (
 )
 
 // Metadata type for JSONB fields
-type Metadata map[string]interface{}
+type Metadata map[string]any
 
 // Value implements driver.Valuer for Metadata
 func (m Metadata) Value() (driver.Value, error) {
@@ -94,7 +94,7 @@ func (m Metadata) Value() (driver.Value, error) {
 }
 
 // Scan implements sql.Scanner for Metadata
-func (m *Metadata) Scan(value interface{}) error {
+func (m *Metadata) Scan(value any) error {
 	if value == nil {
 		*m = nil
 		return nil

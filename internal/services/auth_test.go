@@ -76,15 +76,15 @@ func TestAuthService_Login(t *testing.T) {
 
 	t.Run("successful login", func(t *testing.T) {
 		hashedPassword, _ := hashPassword("password123")
-		
+
 		mock.ExpectQuery("SELECT id, email, first_name, last_name, password FROM users").
-			WithArgs("test@example.com").
+			WithArgs("4359502429542").
 			WillReturnRows(sqlmock.NewRows([]string{"id", "email", "first_name", "last_name", "password"}).
 				AddRow(1, "test@example.com", "John", "Doe", hashedPassword))
 
 		req := LoginRequest{
-			Email:    "test@example.com",
-			Password: "password123",
+			PhoneNumber: "4359502429542",
+			Password:    "password123",
 		}
 
 		body, _ := json.Marshal(req)
@@ -101,12 +101,12 @@ func TestAuthService_Login(t *testing.T) {
 
 	t.Run("user not found", func(t *testing.T) {
 		mock.ExpectQuery("SELECT id, email, first_name, last_name, password FROM users").
-			WithArgs("nonexistent@example.com").
+			WithArgs("34324920424942").
 			WillReturnError(sql.ErrNoRows)
 
 		req := LoginRequest{
-			Email:    "nonexistent@example.com",
-			Password: "password123",
+			PhoneNumber: "34324920424942",
+			Password:    "password123",
 		}
 
 		body, _ := json.Marshal(req)
@@ -127,11 +127,11 @@ func TestPasswordHashing(t *testing.T) {
 	viper.Set("argon2.key_length", 32)
 
 	password := "testpassword"
-	
+
 	hashed, err := hashPassword(password)
 	assert.NoError(t, err)
 	assert.NotEmpty(t, hashed)
-	
+
 	assert.True(t, verifyPassword(password, hashed))
 	assert.False(t, verifyPassword("wrongpassword", hashed))
 }

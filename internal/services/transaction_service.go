@@ -31,6 +31,7 @@ type TransactionService struct {
 	ledger        *DoubleLedgerService
 	audit         *hsm.AuditLogger
 	validator     *ValidationHelper
+	bankService   *BankService
 	feePercentage float64
 	feeFixed      int64
 }
@@ -71,6 +72,7 @@ func NewTransactionService(db *sql.DB, redis *redis.Client, hsmInstance hsm.HSMI
 		ledger:        NewDoubleLedgerService(db),
 		audit:         hsm.NewAuditLogger(),
 		validator:     NewValidationHelper(),
+		bankService:   NewBankService(),
 		feePercentage: feePercentage,
 		feeFixed:      feeFixed,
 	}
@@ -88,6 +90,12 @@ func NewTransactionService(db *sql.DB, redis *redis.Client, hsmInstance hsm.HSMI
 // @Failure 500 {object} map[string]string
 // @Router /transactions [post]
 func (ts *TransactionService) CreateTransaction(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value("userID").(string)
+	if !ok || userID == "" {
+		SendErrorResponse(w, "Unauthorized", http.StatusUnauthorized, nil)
+		return
+	}
+
 	var req struct {
 		Transaction Transaction `json:"transaction"`
 	}
@@ -110,20 +118,39 @@ func (ts *TransactionService) CreateTransaction(w http.ResponseWriter, r *http.R
 
 	tx := req.Transaction
 
+	// Verify card belongs to authenticated user
+	if err := ts.verifyCardOwnership(tx.CardID, userID); err != nil {
+		SendErrorResponse(w, "Unauthorized: Card does not belong to user", http.StatusForbidden, nil)
+		return
+	}
+
 	// Validate transaction struct
 	if err := ts.validator.ValidateStruct(&tx); err != nil {
 		SendErrorResponse(w, "Validation failed", http.StatusBadRequest, err)
 		return
 	}
 
-	// Check for duplicate transaction (idempotency)
+	// Check idempotency (Redis cache first, then DB)
+	if cachedStatus, found := ts.checkIdempotency(tx.TxID); found {
+		log.Printf("[TRANSACTION] Idempotent request detected: %s, cached status: %s", tx.TxID, cachedStatus)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"success":     cachedStatus == "COMPLETED",
+			"transaction": tx,
+			"message":     "Transaction already processed",
+		})
+		return
+	}
+
 	var existingStatus string
 	err := ts.db.QueryRow(`SELECT status FROM transactions WHERE transaction_id = $1`, tx.TxID).Scan(&existingStatus)
 	if err == nil {
 		log.Printf("[TRANSACTION] Duplicate transaction detected: %s, status: %s", tx.TxID, existingStatus)
+		ts.setIdempotency(tx.TxID, existingStatus)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"success":     existingStatus == "COMPLETED",
 			"transaction": tx,
 			"message":     "Transaction already processed",
@@ -174,6 +201,9 @@ func (ts *TransactionService) CreateTransaction(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	// Cache successful transaction for idempotency
+	ts.setIdempotency(tx.TxID, "COMPLETED")
+
 	// Queue for settlement (after commit)
 	if err := ts.queueForSettlement(&tx); err != nil {
 		log.Printf("Failed to queue transaction for settlement: %v", err)
@@ -184,7 +214,7 @@ func (ts *TransactionService) CreateTransaction(w http.ResponseWriter, r *http.R
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"success":     true,
 		"transaction": tx,
 	})
@@ -201,6 +231,12 @@ func (ts *TransactionService) CreateTransaction(w http.ResponseWriter, r *http.R
 // @Failure 400 {object} map[string]string
 // @Router /transactions/batch [post]
 func (ts *TransactionService) BatchTransactions(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value("userID").(string)
+	if !ok || userID == "" {
+		SendErrorResponse(w, "Unauthorized", http.StatusUnauthorized, nil)
+		return
+	}
+
 	var req struct {
 		Transactions []Transaction `json:"transactions"`
 	}
@@ -234,12 +270,21 @@ func (ts *TransactionService) BatchTransactions(w http.ResponseWriter, r *http.R
 	}
 
 	processed := []Transaction{}
-	failed := []map[string]interface{}{}
+	failed := []map[string]any{}
 
 	for _, tx := range req.Transactions {
+		// Verify card belongs to authenticated user
+		if err := ts.verifyCardOwnership(tx.CardID, userID); err != nil {
+			failed = append(failed, map[string]any{
+				"txId":  tx.TxID,
+				"error": "Unauthorized: Card does not belong to user",
+			})
+			continue
+		}
+
 		// Validate
 		if err := ts.validateTransaction(&tx); err != nil {
-			failed = append(failed, map[string]interface{}{
+			failed = append(failed, map[string]any{
 				"txId":  tx.TxID,
 				"error": err.Error(),
 			})
@@ -248,7 +293,7 @@ func (ts *TransactionService) BatchTransactions(w http.ResponseWriter, r *http.R
 
 		// Verify signature
 		if err := ts.verifySignature(&tx); err != nil {
-			failed = append(failed, map[string]interface{}{
+			failed = append(failed, map[string]any{
 				"txId":  tx.TxID,
 				"error": "Signature verification failed",
 			})
@@ -257,7 +302,7 @@ func (ts *TransactionService) BatchTransactions(w http.ResponseWriter, r *http.R
 
 		// Check double spending
 		if err := ts.checkDoubleSpending(&tx); err != nil {
-			failed = append(failed, map[string]interface{}{
+			failed = append(failed, map[string]any{
 				"txId":  tx.TxID,
 				"error": "Double spending detected",
 			})
@@ -267,7 +312,7 @@ func (ts *TransactionService) BatchTransactions(w http.ResponseWriter, r *http.R
 		// Process ledger transfer
 		if err := ts.processLedgerTransfer(&tx); err != nil {
 			ts.audit.LogError(tx.TxID, tx.CardID, err)
-			failed = append(failed, map[string]interface{}{
+			failed = append(failed, map[string]any{
 				"txId":  tx.TxID,
 				"error": "Transfer failed",
 			})
@@ -276,7 +321,7 @@ func (ts *TransactionService) BatchTransactions(w http.ResponseWriter, r *http.R
 
 		// Store
 		if err := ts.storeTransaction(&tx); err != nil {
-			failed = append(failed, map[string]interface{}{
+			failed = append(failed, map[string]any{
 				"txId":  tx.TxID,
 				"error": "Storage failed",
 			})
@@ -292,7 +337,7 @@ func (ts *TransactionService) BatchTransactions(w http.ResponseWriter, r *http.R
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"processed": processed,
 		"FAILED":    failed,
 		"summary": map[string]int{
@@ -370,7 +415,7 @@ func (ts *TransactionService) ListTransactions(w http.ResponseWriter, r *http.Re
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"transactions": transactions,
 		"count":        len(transactions),
 	})
@@ -420,7 +465,7 @@ func (ts *TransactionService) GetRecentTransactions(w http.ResponseWriter, r *ht
 
 // AccountNameEnquiry retrieves account name for a card or account ID
 // @Summary Get account name
-// @Description Retrieve account name for a given account ID and bank code (checks local DB first, then external API)
+// @Description Retrieve account name for a given account ID and bank code
 // @Tags accounts
 // @Produce json
 // @Param accountId query string true "Account ID"
@@ -433,7 +478,7 @@ func (ts *TransactionService) GetRecentTransactions(w http.ResponseWriter, r *ht
 func (ts *TransactionService) AccountNameEnquiry(w http.ResponseWriter, r *http.Request) {
 	accountId := strings.TrimSpace(r.URL.Query().Get("accountId"))
 	bankCode := strings.TrimSpace(r.URL.Query().Get("bankCode"))
-	log.Printf("[ACCOUNT_ENQUIRY] Name enquiry request for accountId: %s, bankCode: %s from IP: %s", accountId, bankCode, r.RemoteAddr)
+	log.Printf("[ACCOUNT_ENQUIRY] Name enquiry request for accountId: %s, bankCode: %s from IP: %s", maskAccountID(accountId), bankCode, r.RemoteAddr)
 
 	if accountId == "" {
 		http.Error(w, "accountId is required", http.StatusBadRequest)
@@ -461,14 +506,14 @@ func (ts *TransactionService) AccountNameEnquiry(w http.ResponseWriter, r *http.
 	`, accountId).Scan(&accountName, &status)
 
 	if err == nil {
-		log.Printf("[ACCOUNT_ENQUIRY] Found in local DB for accountId: %s, account: %s, status: %s", accountId, accountName, status)
+		log.Printf("[ACCOUNT_ENQUIRY] Found in local DB for accountId: %s, account: %s, status: %s", maskAccountID(accountId), accountName, status)
 		if status != "ACTIVE" {
-			log.Printf("[ACCOUNT_ENQUIRY] Account not active for accountId: %s, status: %s", accountId, status)
+			log.Printf("[ACCOUNT_ENQUIRY] Account not active for accountId: %s, status: %s", maskAccountID(accountId), status)
 			http.Error(w, "Account not active", http.StatusForbidden)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"responseCode": "00",
 			"accountId":    accountId,
 			"accountName":  accountName,
@@ -479,17 +524,17 @@ func (ts *TransactionService) AccountNameEnquiry(w http.ResponseWriter, r *http.
 	}
 
 	// Not found locally, try external API
-	log.Printf("[ACCOUNT_ENQUIRY] Not found in local DB, attempting external API lookup for: %s", accountId)
+	log.Printf("[ACCOUNT_ENQUIRY] Not found in local DB, attempting external API lookup for: %s", maskAccountID(accountId))
 	accountName, err = ts.callExternalNameEnquiry(accountId)
 	if err != nil {
-		log.Printf("[ACCOUNT_ENQUIRY] External API lookup failed for accountId %s: %v", accountId, err)
+		log.Printf("[ACCOUNT_ENQUIRY] External API lookup failed for accountId %s: %v", maskAccountID(accountId), err)
 		http.Error(w, "Account not found", http.StatusNotFound)
 		return
 	}
 
-	log.Printf("[ACCOUNT_ENQUIRY] Found via external API for accountId: %s, account: %s", accountId, accountName)
+	log.Printf("[ACCOUNT_ENQUIRY] Found via external API for accountId: %s, account: %s", maskAccountID(accountId), accountName)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"responseCode": "00",
 		"accountId":    accountId,
 		"accountName":  accountName,
@@ -498,83 +543,75 @@ func (ts *TransactionService) AccountNameEnquiry(w http.ResponseWriter, r *http.
 	})
 }
 
-// AccountBalanceEnquiry retrieves account balance for a card or account ID
-// @Summary Get account balance
-// @Description Retrieve account balance for a given account ID and bank code (checks local DB first, then external API)
+// AccountBalanceEnquiry retrieves all accounts and cards for the authenticated user
+// @Summary Get user accounts and cards
+// @Description Retrieve all accounts and cards with balances for the authenticated user
 // @Tags accounts
 // @Produce json
-// @Param accountId query string true "Account ID"
-// @Param bankCode query string false "Bank Code"
-// @Success 200 {object} object{responseCode=string,accountId=string,availableBalance=int64,status=string,source=string}
-// @Failure 404 {object} map[string]string
-// @Failure 403 {object} map[string]string
+// @Success 200 {object} object{responseCode=string,accounts=array,status=string}
+// @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
 // @Router /accounts/balance-enquiry [get]
 func (ts *TransactionService) AccountBalanceEnquiry(w http.ResponseWriter, r *http.Request) {
-	accountId := strings.TrimSpace(r.URL.Query().Get("accountId"))
-	bankCode := strings.TrimSpace(r.URL.Query().Get("bankCode"))
-	log.Printf("[ACCOUNT_ENQUIRY] Balance enquiry request for accountId: %s, bankCode: %s from IP: %s", accountId, bankCode, r.RemoteAddr)
-
-	if accountId == "" {
-		http.Error(w, "accountId is required", http.StatusBadRequest)
+	userID, ok := r.Context().Value("userID").(string)
+	if !ok || userID == "" {
+		SendErrorResponse(w, "Unauthorized", http.StatusUnauthorized, nil)
 		return
 	}
 
-	if !isValidAccountId(accountId) {
-		http.Error(w, "invalid accountId format", http.StatusBadRequest)
-		return
-	}
+	log.Printf("[ACCOUNT_ENQUIRY] Fetching accounts for userID: %s", userID)
 
-	if bankCode != "" && !isValidBankCode(bankCode) {
-		http.Error(w, "invalid bankCode format", http.StatusBadRequest)
-		return
-	}
-
-	// Try local DB
-	log.Printf("[ACCOUNT_ENQUIRY] Attempting local DB lookup for: %s", accountId)
-	var balance int64
-	var status string
-	err := ts.db.QueryRow(`
-		SELECT balance, status FROM accounts 
-		WHERE card_id = $1 OR account_id = $1
-		LIMIT 1
-	`, accountId).Scan(&balance, &status)
-
-	if err == nil {
-		log.Printf("[ACCOUNT_ENQUIRY] Found in local DB for accountId: %s, balance: %d, status: %s", accountId, balance, status)
-		if status != "ACTIVE" {
-			log.Printf("[ACCOUNT_ENQUIRY] Account not active for accountId: %s, status: %s", accountId, status)
-			http.Error(w, "Account not active", http.StatusForbidden)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"responseCode":     "00",
-			"accountId":        accountId,
-			"availableBalance": balance,
-			"status":           "SUCCESS",
-			"source":           "local",
-		})
-		return
-	}
-
-	// Not found locally, try external API
-	log.Printf("[ACCOUNT_ENQUIRY] Not found in local DB, attempting external API lookup for: %s", accountId)
-	balance, err = ts.callExternalBalanceEnquiry(accountId)
+	rows, err := ts.db.Query(`
+		SELECT id, account_id, card_id, account_name, balance, status, 
+		       COALESCE(is_primary, false) as is_primary, 
+		       COALESCE(bank_name, '') as bank_name, 
+		       COALESCE(bank_code, '') as bank_code
+		FROM accounts 
+		WHERE user_id = $1
+	`, userID)
 	if err != nil {
-		log.Printf("[ACCOUNT_ENQUIRY] External API lookup failed for accountId %s: %v", accountId, err)
-		http.Error(w, "Account not found", http.StatusNotFound)
+		log.Printf("[ACCOUNT_ENQUIRY] Database query failed: %v", err)
+		http.Error(w, "Failed to fetch accounts", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var accounts []map[string]any
+	for rows.Next() {
+		var id, accountName, status string
+		var accountID, cardID, bankName, bankCode sql.NullString
+		var balance int64
+		var isPrimary bool
+		if err := rows.Scan(&id, &accountID, &cardID, &accountName, &balance, &status, &isPrimary, &bankName, &bankCode); err != nil {
+			log.Printf("[ACCOUNT_ENQUIRY] Row scan failed: %v", err)
+			continue
+		}
+		accounts = append(accounts, map[string]any{
+			"id":               id,
+			"accountId":        accountID.String,
+			"cardId":           cardID.String,
+			"accountName":      accountName,
+			"availableBalance": balance,
+			"status":           status,
+			"isPrimary":        isPrimary,
+			"bankName":         bankName.String,
+			"bankCode":         bankCode.String,
+			"bankLogo":         ts.bankService.LoadLogo(bankCode.String),
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("[ACCOUNT_ENQUIRY] Rows iteration error: %v", err)
+		http.Error(w, "Failed to process accounts", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[ACCOUNT_ENQUIRY] Found via external API for accountId: %s, balance: %d", accountId, balance)
+	log.Printf("[ACCOUNT_ENQUIRY] Found %d accounts for userID: %s", len(accounts), userID)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"responseCode":     "00",
-		"accountId":        accountId,
-		"availableBalance": balance,
-		"status":           "SUCCESS",
-		"source":           "external",
+	json.NewEncoder(w).Encode(map[string]any{
+		"responseCode": "00",
+		"accounts":     accounts,
+		"status":       "SUCCESS",
 	})
 }
 
@@ -621,14 +658,18 @@ func (ts *TransactionService) validateTransaction(tx *Transaction) error {
 		return errors.New("signature is required")
 	}
 
-	// Check timestamp (not too old, not in future)
+	// Replay-attack prevention: strict timestamp validation
 	now := time.Now().Unix()
-	if tx.Timestamp > now+60 {
+	if tx.Timestamp > now+30 {
 		return errors.New("transaction timestamp is in the future")
 	}
+	if tx.Timestamp < now-300 {
+		return errors.New("transaction timestamp expired (>5 min)")
+	}
 
-	if tx.Timestamp < now-86400*7 {
-		return errors.New("transaction timestamp is too old (>7 days)")
+	// Check nonce/txID hasn't been used (Redis)
+	if err := ts.checkReplayAttack(tx.TxID, tx.Timestamp); err != nil {
+		return err
 	}
 
 	return nil
@@ -753,16 +794,74 @@ func (ts *TransactionService) checkDoubleSpending(tx *Transaction) error {
 	return nil
 }
 
+// checkReplayAttack prevents replay attacks using Redis nonce tracking
+func (ts *TransactionService) checkReplayAttack(txID string, timestamp int64) error {
+	ctx := context.Background()
+	key := fmt.Sprintf("nonce:%s", txID)
+
+	exists, err := ts.redis.Exists(ctx, key).Result()
+	if err != nil {
+		return fmt.Errorf("replay check failed: %v", err)
+	}
+	if exists > 0 {
+		return errors.New("replay attack detected: nonce already used")
+	}
+
+	// Store nonce with 10-minute expiry
+	if err := ts.redis.SetEX(ctx, key, timestamp, 10*time.Minute).Err(); err != nil {
+		return fmt.Errorf("failed to store nonce: %v", err)
+	}
+	return nil
+}
+
+// checkIdempotency checks if transaction already processed (Redis cache)
+func (ts *TransactionService) checkIdempotency(txID string) (string, bool) {
+	ctx := context.Background()
+	key := fmt.Sprintf("idempotency:%s", txID)
+
+	status, err := ts.redis.Get(ctx, key).Result()
+	if err == nil {
+		return status, true
+	}
+	return "", false
+}
+
+// setIdempotency caches transaction result for idempotency
+func (ts *TransactionService) setIdempotency(txID, status string) {
+	ctx := context.Background()
+	key := fmt.Sprintf("idempotency:%s", txID)
+	ts.redis.SetEX(ctx, key, status, 24*time.Hour)
+}
+
+// maskCardID masks card ID for logging (shows last 4 digits)
+func maskCardID(cardID string) string {
+	if len(cardID) <= 4 {
+		return "****"
+	}
+	return "****" + cardID[len(cardID)-4:]
+}
+
+// maskAccountID masks account ID for logging
+func maskAccountID(accountID string) string {
+	if len(accountID) <= 4 {
+		return "****"
+	}
+	return "****" + accountID[len(accountID)-4:]
+}
+
 func (ts *TransactionService) storeTransaction(tx *Transaction) error {
 	tx.Status = "COMPLETED"
 	tx.CreatedAt = time.Now()
 
+	var userID int
+	ts.db.QueryRow(`SELECT user_id FROM accounts WHERE card_id = $1`, tx.CardID).Scan(&userID)
+
 	_, err := ts.db.Exec(`
         INSERT INTO transactions 
-        (transaction_id, from_card_id, to_card_id, amount, currency, type, signature, status, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        (transaction_id, from_card_id, to_card_id, amount, currency, type, signature, status, user_id, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     `, tx.TxID, tx.CardID, tx.MerchantID, tx.Amount, tx.Currency,
-		tx.TxType, tx.Signature, tx.Status, tx.CreatedAt)
+		tx.TxType, tx.Signature, tx.Status, userID, tx.CreatedAt)
 
 	return err
 }
@@ -771,12 +870,15 @@ func (ts *TransactionService) storeTransactionTx(dbTx *sql.Tx, tx *Transaction) 
 	tx.Status = "COMPLETED"
 	tx.CreatedAt = time.Now()
 
+	var userID int
+	dbTx.QueryRow(`SELECT user_id FROM accounts WHERE card_id = $1`, tx.CardID).Scan(&userID)
+
 	_, err := dbTx.Exec(`
         INSERT INTO transactions 
-        (transaction_id, from_card_id, to_card_id, amount, currency, type, signature, status, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        (transaction_id, from_card_id, to_card_id, amount, currency, type, signature, status, user_id, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     `, tx.TxID, tx.CardID, tx.MerchantID, tx.Amount, tx.Currency,
-		tx.TxType, tx.Signature, tx.Status, tx.CreatedAt)
+		tx.TxType, tx.Signature, tx.Status, userID, tx.CreatedAt)
 
 	return err
 }
@@ -805,7 +907,7 @@ func (ts *TransactionService) queueForSettlement(tx *Transaction) error {
 
 func (ts *TransactionService) notifyTransaction(tx *Transaction) {
 	// Send notification (SMS, push, etc.)
-	log.Printf("Notification: Transaction %s completed for card %s", tx.TxID, tx.CardID)
+	log.Printf("Notification: Transaction %s completed for card %s", tx.TxID, maskCardID(tx.CardID))
 }
 
 func (ts *TransactionService) batchSettlement(transactions []Transaction) {
@@ -862,7 +964,7 @@ func (ts *TransactionService) fetchTransaction(txID string) (*Transaction, error
 	err := ts.db.QueryRow(`
         SELECT transaction_id, from_card_id, to_card_id, amount::text, currency, 
                EXTRACT(EPOCH FROM created_at)::bigint as timestamp,
-               COALESCE(signature, '') as signature, COALESCE(type, 'transfer') as type, status, created_at
+               COALESCE(signature, '') as signature, COALESCE(type, 'DEBIT') as type, status, created_at
         FROM transactions
         WHERE transaction_id = $1
     `, txID).Scan(
@@ -889,7 +991,7 @@ func (ts *TransactionService) fetchTransaction(txID string) (*Transaction, error
 
 func (ts *TransactionService) fetchTransactions(cardID, status string, limit int) ([]Transaction, error) {
 	var conditions []string
-	var args []interface{}
+	var args []any
 	argIndex := 1
 
 	baseQuery := `
@@ -950,24 +1052,18 @@ func (ts *TransactionService) fetchTransactions(cardID, status string, limit int
 
 func (ts *TransactionService) fetchRecentTransactions(userID string, limit int) ([]Transaction, error) {
 	query := `
-		SELECT t.transaction_id, t.from_card_id, t.to_card_id, t.amount, t.currency, 
-		       0 as counter, EXTRACT(EPOCH FROM t.created_at)::bigint as timestamp,
-		       COALESCE(t.signature, '') as signature, COALESCE(t.type, 'DEBIT') as type, t.status, t.created_at
-		FROM transactions t
-		INNER JOIN cards c1 ON t.from_card_id = c1.card_id
-		INNER JOIN users u1 ON c1.user_id = u1.id
-		WHERE u1.id = $1::integer
-		   OR EXISTS (
-		       SELECT 1 FROM cards c2 
-		       INNER JOIN users u2 ON c2.user_id = u2.id
-		       WHERE c2.card_id = t.to_card_id AND u2.id = $1::integer
-		   )
-		ORDER BY t.created_at DESC
+		SELECT transaction_id, from_card_id, to_card_id, amount::text, currency, 
+		       0 as counter, EXTRACT(EPOCH FROM created_at)::bigint as timestamp,
+		       COALESCE(signature, '') as signature, COALESCE(type, 'DEBIT') as type, status, created_at
+		FROM transactions
+		WHERE user_id = $1::integer
+		ORDER BY created_at DESC
 		LIMIT $2
 	`
 
 	rows, err := ts.db.Query(query, userID, limit)
 	if err != nil {
+		log.Printf("[TRANSACTION] Failed to query recent transactions for user %s: %v", userID, err)
 		return nil, err
 	}
 	defer rows.Close()
@@ -981,6 +1077,7 @@ func (ts *TransactionService) fetchRecentTransactions(userID string, limit int) 
 			&tx.Counter, &tx.Timestamp, &tx.Signature, &dbType, &tx.Status, &tx.CreatedAt,
 		)
 		if err != nil {
+			log.Printf("[TRANSACTION] Failed to scan transaction row for user %s: %v", userID, err)
 			return nil, err
 		}
 		amount, _ := strconv.ParseFloat(amountStr, 64)
@@ -1091,6 +1188,73 @@ func isValidAccountId(s string) bool {
 func isValidBankCode(s string) bool {
 	return bankCodeRegex.MatchString(s)
 }
+
+// verifyCardOwnership checks if the card belongs to the authenticated user
+func (ts *TransactionService) verifyCardOwnership(cardID, userID string) error {
+	var ownerID int
+	err := ts.db.QueryRow(`
+		SELECT user_id FROM cards WHERE card_id = $1
+	`, cardID).Scan(&ownerID)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return errors.New("card not found")
+		}
+		return errors.New("failed to verify card ownership")
+	}
+
+	userIDInt, err := strconv.Atoi(userID)
+	if err != nil {
+		return errors.New("invalid user ID")
+	}
+
+	if ownerID != userIDInt {
+		return errors.New("card does not belong to user")
+	}
+
+	return nil
+}
+
+// verifyAccountOwnership checks if the account belongs to the authenticated user
+func (ts *TransactionService) verifyAccountOwnership(accountIdentifier, userID string) error {
+	var ownerID int
+	// Try direct lookup first (if user_id column exists in accounts)
+	err := ts.db.QueryRow(`
+		SELECT user_id 
+		FROM accounts
+		WHERE (account_id = $1 OR card_id = $1) AND user_id IS NOT NULL
+		LIMIT 1
+	`, accountIdentifier).Scan(&ownerID)
+
+	// Fallback to JOIN if user_id not populated
+	if err == sql.ErrNoRows {
+		err = ts.db.QueryRow(`
+			SELECT c.user_id 
+			FROM accounts a
+			JOIN cards c ON a.card_id = c.card_id
+			WHERE a.account_id = $1 OR a.card_id = $1
+			LIMIT 1
+		`, accountIdentifier).Scan(&ownerID)
+	}
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return errors.New("account not found")
+		}
+		return errors.New("failed to verify account ownership")
+	}
+
+	userIDInt, err := strconv.Atoi(userID)
+	if err != nil {
+		return errors.New("invalid user ID")
+	}
+
+	if ownerID != userIDInt {
+		return errors.New("account does not belong to user")
+	}
+
+	return nil
+}
 func (ts *TransactionService) processLedgerTransfer(tx *Transaction) error {
 	// Transfer from card account to merchant account
 	err := ts.ledger.Transfer(tx.CardID, tx.MerchantID, tx.TxID, tx.Amount)
@@ -1104,6 +1268,11 @@ func (ts *TransactionService) processLedgerTransfer(tx *Transaction) error {
 	return nil
 }
 
+func (ts *TransactionService) calculateFee(amount int64) int64 {
+	fee := int64(float64(amount) * ts.feePercentage / 100)
+	return fee + ts.feeFixed
+}
+
 // ExternalBankTransfer handles bank-to-bank transfers using ISO 20022
 // @Summary Send external bank transfer
 // @Description Process bank-to-bank transfer using ISO 20022 messaging
@@ -1115,12 +1284,13 @@ func (ts *TransactionService) processLedgerTransfer(tx *Transaction) error {
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
 // @Router /transactions/external [post]
-func (ts *TransactionService) calculateFee(amount int64) int64 {
-	fee := int64(float64(amount) * ts.feePercentage / 100)
-	return fee + ts.feeFixed
-}
-
 func (ts *TransactionService) ExternalBankTransfer(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value("userID").(string)
+	if !ok || userID == "" {
+		SendErrorResponse(w, "Unauthorized", http.StatusUnauthorized, nil)
+		return
+	}
+
 	var req models.ExternalBankTransfer
 
 	ipAddress := r.RemoteAddr
@@ -1173,13 +1343,26 @@ func (ts *TransactionService) ExternalBankTransfer(w http.ResponseWriter, r *htt
 	}
 	log.Printf("[EXTERNAL_TRANSFER] Transaction ID: %s", txID)
 
-	// Check for duplicate transaction (idempotency)
+	// Check idempotency (Redis cache first, then DB)
+	if cachedStatus, found := ts.checkIdempotency(txID); found {
+		log.Printf("[EXTERNAL_TRANSFER] Idempotent request detected: %s, cached status: %s", txID, cachedStatus)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"success":       cachedStatus == "PENDING" || cachedStatus == "COMPLETED",
+			"transactionId": txID,
+			"status":        cachedStatus,
+			"message":       "Transaction already processed",
+		})
+		return
+	}
+
 	var existingStatus string
 	err := ts.db.QueryRow(`SELECT status FROM transactions WHERE transaction_id = $1`, txID).Scan(&existingStatus)
 	if err == nil {
 		log.Printf("[EXTERNAL_TRANSFER] Duplicate transaction detected: %s, status: %s", txID, existingStatus)
+		ts.setIdempotency(txID, existingStatus)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"success":       existingStatus == "PENDING" || existingStatus == "COMPLETED",
 			"transactionId": txID,
 			"status":        existingStatus,
@@ -1197,6 +1380,13 @@ func (ts *TransactionService) ExternalBankTransfer(w http.ResponseWriter, r *htt
 	}
 	defer tx.Rollback()
 
+	// Verify account belongs to authenticated user
+	if err := ts.verifyAccountOwnership(req.FromAccount, userID); err != nil {
+		log.Printf("[EXTERNAL_TRANSFER] Account ownership verification failed: %v", err)
+		SendErrorResponse(w, "Unauthorized: Account does not belong to user", http.StatusForbidden, nil)
+		return
+	}
+
 	// Validate source account
 	var balance int64
 	var status string
@@ -1210,7 +1400,7 @@ func (ts *TransactionService) ExternalBankTransfer(w http.ResponseWriter, r *htt
 		log.Printf("[EXTERNAL_TRANSFER] Source account not found: %s", req.FromAccount)
 		amount := int64(req.Amount)
 		fee := ts.calculateFee(amount)
-		var locationJSON []byte
+		var locationJSON any
 		if req.Location != nil {
 			locationJSON, _ = json.Marshal(req.Location)
 		}
@@ -1219,7 +1409,7 @@ func (ts *TransactionService) ExternalBankTransfer(w http.ResponseWriter, r *htt
 		_, _ = tx.Exec(`
 			INSERT INTO transactions 
 			(transaction_id, from_card_id, to_card_id, amount, fee, total_amount, currency, narration, type, status, location, metadata, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'transfer', $9, $10, $11, NOW())
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'DEBIT', $9, $10, $11, NOW())
 		`, txID, req.FromAccount, req.ToAccount, amount, fee, amount+fee, req.Currency, req.Narration, "FAILED_ACCOUNT_NOT_FOUND", locationJSON, metadataJSON)
 		tx.Commit()
 		ts.audit.LogError(txID, req.FromAccount, errors.New("source account not found"))
@@ -1231,16 +1421,16 @@ func (ts *TransactionService) ExternalBankTransfer(w http.ResponseWriter, r *htt
 		log.Printf("[EXTERNAL_TRANSFER] Source account not active: %s", req.FromAccount)
 		amount := int64(req.Amount)
 		fee := ts.calculateFee(amount)
-		var locationJSON []byte
+		var locationJSON any
 		if req.Location != nil {
 			locationJSON, _ = json.Marshal(req.Location)
 		}
-		metadata := map[string]interface{}{"ip_address": ipAddress}
+		metadata := map[string]any{"ip_address": ipAddress}
 		metadataJSON, _ := json.Marshal(metadata)
 		_, _ = tx.Exec(`
 			INSERT INTO transactions 
 			(transaction_id, from_card_id, to_card_id, amount, fee, total_amount, currency, narration, type, status, location, metadata, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'transfer', $9, $10, $11, NOW())
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'DEBIT', $9, $10, $11, NOW())
 		`, txID, req.FromAccount, req.ToAccount, amount, fee, amount+fee, req.Currency, req.Narration, "FAILED_ACCOUNT_NOT_ACTIVE", locationJSON, metadataJSON)
 		tx.Commit()
 		ts.audit.LogError(txID, req.FromAccount, errors.New("account not active"))
@@ -1254,16 +1444,16 @@ func (ts *TransactionService) ExternalBankTransfer(w http.ResponseWriter, r *htt
 
 	if balance < totalAmount {
 		log.Printf("[EXTERNAL_TRANSFER] Insufficient balance: %d < %d", balance, totalAmount)
-		var locationJSON []byte
+		var locationJSON any
 		if req.Location != nil {
 			locationJSON, _ = json.Marshal(req.Location)
 		}
-		metadata := map[string]interface{}{"ip_address": ipAddress}
+		metadata := map[string]any{"ip_address": ipAddress}
 		metadataJSON, _ := json.Marshal(metadata)
 		_, _ = tx.Exec(`
 			INSERT INTO transactions 
 			(transaction_id, from_card_id, to_card_id, amount, fee, total_amount, currency, narration, type, status, location, metadata, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'transfer', $9, $10, $11, NOW())
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'DEBIT', $9, $10, $11, NOW())
 		`, txID, req.FromAccount, req.ToAccount, amount, fee, totalAmount, req.Currency, req.Narration, "FAILED_INSUFFICIENT_BALANCE", locationJSON, metadataJSON)
 		tx.Commit()
 		ts.audit.LogError(txID, req.FromAccount, errors.New("insufficient balance"))
@@ -1281,16 +1471,16 @@ func (ts *TransactionService) ExternalBankTransfer(w http.ResponseWriter, r *htt
 
 	if err != nil {
 		log.Printf("[EXTERNAL_TRANSFER] Failed to debit account: %v", err)
-		var locationJSON []byte
+		var locationJSON any
 		if req.Location != nil {
 			locationJSON, _ = json.Marshal(req.Location)
 		}
-		metadata := map[string]interface{}{"ip_address": ipAddress}
+		metadata := map[string]any{"ip_address": ipAddress}
 		metadataJSON, _ := json.Marshal(metadata)
 		_, _ = tx.Exec(`
 			INSERT INTO transactions 
 			(transaction_id, from_card_id, to_card_id, amount, fee, total_amount, currency, narration, type, status, location, metadata, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'transfer', $9, $10, $11, NOW())
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'DEBIT', $9, $10, $11, NOW())
 		`, txID, req.FromAccount, req.ToAccount, amount, fee, totalAmount, req.Currency, req.Narration, "FAILED_DEBIT_ERROR", locationJSON, metadataJSON)
 		tx.Commit()
 		ts.audit.LogError(txID, req.FromAccount, err)
@@ -1301,16 +1491,16 @@ func (ts *TransactionService) ExternalBankTransfer(w http.ResponseWriter, r *htt
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
 		log.Printf("[EXTERNAL_TRANSFER] No rows affected, insufficient balance")
-		var locationJSON []byte
+		var locationJSON any
 		if req.Location != nil {
 			locationJSON, _ = json.Marshal(req.Location)
 		}
-		metadata := map[string]interface{}{"ip_address": ipAddress}
+		metadata := map[string]any{"ip_address": ipAddress}
 		metadataJSON, _ := json.Marshal(metadata)
 		_, _ = tx.Exec(`
 			INSERT INTO transactions 
 			(transaction_id, from_card_id, to_card_id, amount, fee, total_amount, currency, narration, type, status, location, metadata, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'transfer', $9, $10, $11, NOW())
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'DEBIT', $9, $10, $11, NOW())
 		`, txID, req.FromAccount, req.ToAccount, amount, fee, totalAmount, req.Currency, req.Narration, "FAILED_INSUFFICIENT_BALANCE", locationJSON, metadataJSON)
 		tx.Commit()
 		ts.audit.LogError(txID, req.FromAccount, errors.New("insufficient balance"))
@@ -1320,16 +1510,16 @@ func (ts *TransactionService) ExternalBankTransfer(w http.ResponseWriter, r *htt
 
 	// Store transaction
 	log.Printf("[EXTERNAL_TRANSFER] Storing transaction record")
-	var locationJSON []byte
+	var locationJSON any
 	if req.Location != nil {
 		locationJSON, _ = json.Marshal(req.Location)
 	}
-	metadata := map[string]interface{}{"ip_address": ipAddress}
+	metadata := map[string]any{"ip_address": ipAddress}
 	metadataJSON, _ := json.Marshal(metadata)
 	_, err = tx.Exec(`
 		INSERT INTO transactions 
 		(transaction_id, from_card_id, to_card_id, amount, fee, total_amount, currency, narration, type, status, location, metadata, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'transfer', $9, $10, $11, NOW())
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'DEBIT', $9, $10, $11, NOW())
 	`, txID, req.FromAccount, req.ToAccount, amount, fee, totalAmount, req.Currency, req.Narration, "PENDING", locationJSON, metadataJSON)
 
 	if err != nil {
@@ -1364,6 +1554,9 @@ func (ts *TransactionService) ExternalBankTransfer(w http.ResponseWriter, r *htt
 		http.Error(w, "Failed to process transfer", http.StatusInternalServerError)
 		return
 	}
+
+	// Cache transaction for idempotency
+	ts.setIdempotency(txID, "PENDING")
 
 	// Create ISO 20022 transaction (after DB commit)
 	modelTx := &models.Transaction{
@@ -1402,7 +1595,7 @@ func (ts *TransactionService) ExternalBankTransfer(w http.ResponseWriter, r *htt
 	ts.audit.LogTransfer(txID, req.FromAccount, req.ToAccount, amount, "PENDING")
 	log.Printf("[EXTERNAL_TRANSFER] Transfer successful: %s", txID)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"success":       true,
 		"transactionId": txID,
 		"status":        "PENDING",

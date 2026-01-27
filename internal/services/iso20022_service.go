@@ -13,7 +13,7 @@ import (
 	"github.com/ruralpay/backend/internal/models"
 )
 
-type ISO20022Service struct{
+type ISO20022Service struct {
 	validator *ValidationHelper
 }
 
@@ -61,7 +61,7 @@ func (iso *ISO20022Service) ConvertToISO20022(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"status":      "converted",
 		"messageType": "pacs.008.001.08",
 		"xml":         xmlData,
@@ -106,7 +106,7 @@ func (iso *ISO20022Service) ProcessSettlement(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"status":      "settled",
 		"messageType": "pacs.002.001.08",
 	})
@@ -116,7 +116,7 @@ func (iso *ISO20022Service) ConvertTransaction(tx *models.Transaction) (*pacs_v0
 	return iso.CreatePacs008(tx)
 }
 
-func (iso *ISO20022Service) SendToSettlement(doc interface{}) error {
+func (iso *ISO20022Service) SendToSettlement(doc any) error {
 	// Convert to XML and send to settlement system
 	xmlData, err := xml.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -210,7 +210,7 @@ func (iso *ISO20022Service) CreatePacs002(tx *models.Transaction, status string)
 }
 
 // ConvertToXML converts ISO20022 document to XML string
-func (iso *ISO20022Service) ConvertToXML(doc interface{}) (string, error) {
+func (iso *ISO20022Service) ConvertToXML(doc any) (string, error) {
 	xmlData, err := xml.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal XML: %w", err)

@@ -114,14 +114,23 @@ func main() {
 	transactionService := services.NewTransactionService(db, redisClient, hsm)
 	provisioningService := services.NewCardProvisioningService(db, hsm)
 	iso20022Service := services.NewISO20022Service()
-	authService := services.NewAuthService(db)
+	authService := services.NewAuthService(db, redisClient)
 	ussdService := services.NewUSSDService(db, redisClient)
 	ussdHandler := handlers.NewUSSDHandler(ussdService)
+	qrService := services.NewQRService(db, redisClient)
+	qrHandler := handlers.NewQRHandler(qrService)
+	bankService := services.NewBankService()
+	voiceService := services.NewVoiceBankingService()
+	defer voiceService.Close()
+
+	// Initialize auth middleware with Redis
+	mW.InitAuthMiddleware(redisClient)
 
 	// Setup router
 	r := chi.NewRouter()
 
 	// Middleware
+	r.Use(mW.SecurityHeaders)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RealIP)
@@ -134,7 +143,7 @@ func main() {
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "Access-Control-Allow-Origin"},
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
-		MaxAge:           300,
+		MaxAge:           86400,
 	}))
 
 	// Health check
@@ -152,25 +161,34 @@ func main() {
 		http.ServeFile(w, r, "./api/openapi.yaml")
 	})
 
+	// Static file server for bank logos
+	r.Handle("/static/bank-logos/*", http.StripPrefix("/static/bank-logos/",
+		mW.StaticFileServer("./static/bank-logos")))
+
 	// API routes
 	r.Route("/api/v1", func(r chi.Router) {
 		// Public endpoints (no auth required)
 		r.Post("/auth/register", authService.Register)
 		r.Post("/auth/login", authService.Login)
 		r.Post("/auth/logout", authService.Logout)
-		r.Get("/transactions", transactionService.ListTransactions)
-		r.Get("/transactions/{txId}", transactionService.GetTransaction)
+		r.Get("/banks", bankService.GetAllBanks)
+		r.Post("/accounts/validate-bvn", authService.ValidateBVN)
+		r.Post("/accounts/verify-otp", authService.VerifyOTP)
 
 		// Protected endpoints (auth required)
 		r.Group(func(r chi.Router) {
 			r.Use(mW.AuthMiddleware)
+
+			r.Get("/auth/account", authService.GetUserAccount)
+
+			r.Get("/transactions", transactionService.ListTransactions)
+			r.Get("/transactions/{txId}", transactionService.GetTransaction)
 			r.Post("/transactions", transactionService.CreateTransaction)
 			r.Post("/transactions/batch", transactionService.BatchTransactions)
 			r.Post("/transactions/external", transactionService.ExternalBankTransfer)
 			r.Get("/transactions/recent", transactionService.GetRecentTransactions)
 
 			// User account endpoint
-			r.Get("/account", authService.GetUserAccount)
 
 			// Account enquiry endpoints (supports accountId query parameter)
 			r.Get("/accounts/name-enquiry", transactionService.AccountNameEnquiry)
@@ -191,6 +209,13 @@ func main() {
 			r.Post("/ussd/generate", ussdHandler.GenerateCode)
 			r.Post("/ussd/validate", ussdHandler.ValidateCode)
 			r.Get("/ussd/codes", ussdHandler.GetUserCodes)
+
+			// QR endpoints
+			r.Post("/qr/generate", qrHandler.GenerateQR)
+			r.Post("/qr/process", qrHandler.ProcessQR)
+
+			// Voice banking endpoints
+			r.Post("/transactions/voice-transcribe", voiceService.TranscribeAudio)
 		})
 	})
 

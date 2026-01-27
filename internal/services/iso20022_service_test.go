@@ -32,7 +32,7 @@ func TestISO20022Service_ConvertToISO20022(t *testing.T) {
 		service.ConvertToISO20022(w, r)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		var response map[string]interface{}
+		var response map[string]any
 		json.Unmarshal(w.Body.Bytes(), &response)
 		assert.Equal(t, "converted", response["status"])
 		assert.Equal(t, "pacs.008.001.08", response["messageType"])
@@ -87,7 +87,7 @@ func TestISO20022Service_ProcessSettlement(t *testing.T) {
 		service.ProcessSettlement(w, r)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		var response map[string]interface{}
+		var response map[string]any
 		json.Unmarshal(w.Body.Bytes(), &response)
 		assert.Equal(t, "settled", response["status"])
 		assert.Equal(t, "pacs.002.001.08", response["messageType"])
